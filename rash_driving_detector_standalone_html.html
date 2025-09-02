@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rash Driving Detector (GPS + Gyro)</title>
+  <style>
+    :root{
+      --bg:#0b1020; --card:#121a33; --muted:#9fb0ff; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --txt:#e7ecff;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Arial;background:radial-gradient(1200px 800px at 20% -20%, #1a245a22, transparent),var(--bg);color:var(--txt)}
+    header{padding:18px 20px;display:flex;gap:12px;align-items:center;justify-content:space-between;border-bottom:1px solid #ffffff10}
+    h1{font-size:clamp(18px,3.2vw,28px);margin:0;letter-spacing:0.2px}
+    .row{display:grid;gap:12px;padding:14px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+    .card{background:var(--card);border:1px solid #ffffff14;border-radius:18px;padding:14px;box-shadow:0 10px 30px #00000044}
+    .kpi{font-size:32px;font-weight:800;margin:4px 0}
+    .sub{opacity:.85;font-size:12px}
+    .flex{display:flex;gap:12px;align-items:center}
+    .pill{padding:4px 10px;border-radius:999px;border:1px solid #ffffff22;font-size:12px}
+    .ok{color:var(--ok);border-color:color-mix(in srgb, var(--ok) 55%, transparent)}
+    .warn{color:var(--warn);border-color:color-mix(in srgb, var(--warn) 55%, transparent)}
+    .bad{color:var(--bad);border-color:color-mix(in srgb, var(--bad) 55%, transparent)}
+    button{background:#243269;color:#dbe2ff;border:1px solid #5470ff66;padding:10px 14px;border-radius:12px;font-weight:700;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    #compass{height:140px;display:grid;place-items:center}
+    .needle{width:0;height:0;border:10px solid transparent;border-bottom-color:#7ea0ff;filter:drop-shadow(0 2px 4px #000000aa)}
+    .log{max-height:160px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12px;background:#0c1330;border:1px solid #ffffff14;border-radius:12px;padding:8px}
+    .footer{opacity:.7;padding:0 16px 16px;font-size:12px}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Rash Driving Detector</h1>
+    <div class="flex">
+      <button id="btnStart">Start Sensors</button>
+      <button id="btnStop" disabled>Stop</button>
+    </div>
+  </header>
+
+  <section class="row">
+    <div class="card">
+      <div class="sub">GPS Status</div>
+      <div id="gpsState" class="kpi">—</div>
+      <div class="sub">Lat <span id="lat">—</span> · Lon <span id="lon">—</span></div>
+      <div class="sub">Accuracy: <span id="acc">—</span> m</div>
+    </div>
+    <div class="card">
+      <div class="sub">Speed (km/h)</div>
+      <div id="speed" class="kpi">0.0</div>
+      <div class="sub">Source: <span id="speedSrc">—</span></div>
+      <div class="sub">Accel est. (m/s²): <span id="accel">0.0</span></div>
+    </div>
+    <div class="card">
+      <div class="sub">Heading</div>
+      <div id="heading" class="kpi">—</div>
+      <div id="compass">
+        <div id="needle" class="needle"></div>
+      </div>
+      <div class="sub">Gyro (°/s): α=<span id="rAlpha">0</span> β=<span id="rBeta">0</span> γ=<span id="rGamma">0</span></div>
+    </div>
+    <div class="card">
+      <div class="sub">Rash Score (0–100)</div>
+      <div id="score" class="kpi">0</div>
+      <div class="flex"><span class="pill" id="riskTag">Idle</span></div>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="card" style="grid-column:1/-1">
+      <div class="sub" style="margin-bottom:6px">Alerts</div>
+      <div id="alerts" class="log"></div>
+    </div>
+  </section>
+
+  <div class="footer">⚠️ Works best over HTTPS on a real phone. Motion sensors on iOS require you to tap <em>Start Sensors</em> to grant permission. This is an experimental estimator and should not be used as a safety-of-life system.</div>
+
+  <script>
+    // --- State ---
+    let watchId = null;
+    let lastFix = null; // {lat, lon, t, v}
+    let speedKmh = 0;
+    let derivedSpeed = false;
+    let accelFromSpeed = 0; // m/s^2
+
+    let rashScore = 0; // 0–100
+
+    // Smoothing helpers
+    const ema = (alpha) => {
+      let y = null; return (x) => { y = (y===null)? x : (alpha*x + (1-alpha)*y); return y; };
+    };
+    const smoothSpeed = ema(0.4);
+    const smoothAccel = ema(0.4);
+
+    // UI helpers
+    const $ = (id) => document.getElementById(id);
+    const log = (msg) => {
+      const node = document.createElement('div');
+      const t = new Date().toLocaleTimeString();
+      node.textContent = `[${t}] ${msg}`;
+      const area = $('alerts');
+      area.prepend(node);
+      while(area.childNodes.length>200) area.removeChild(area.lastChild);
+    };
+
+    function setRiskTag(level){
+      const tag = $('riskTag');
+      tag.classList.remove('ok','warn','bad');
+      if(level==='Low'){ tag.classList.add('ok'); }
+      if(level==='Medium'){ tag.classList.add('warn'); }
+      if(level==='High'){ tag.classList.add('bad'); }
+      tag.textContent = level;
+    }
+
+    function haversine(lat1, lon1, lat2, lon2){
+      const R = 6371000; // meters
+      const toRad = (d)=> d*Math.PI/180;
+      const dLat = toRad(lat2-lat1);
+      const dLon = toRad(lon2-lon1);
+      const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+      const c = 2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R*c; // meters
+    }
+
+    function updateScore(features){
+      // features: {speedKmh, accel, rotGamma, rotBeta}
+      const {speedKmh, accel, rotGamma, rotBeta} = features;
+      let score = 0;
+      // Speed contribution (cap at 140km/h)
+      score += Math.min(140, Math.max(0, speedKmh)) * 0.25; // up to 35
+      // Harsh accel/brake (>3 m/s^2 is harsh, >5 severe)
+      const a = Math.abs(accel);
+      score += Math.max(0, a-1) * 6; // a=3 -> 12 pts, a=5 -> 24 pts
+      // Cornering via rotationRate around Y/Z (beta/gamma)
+      const rot = Math.max(Math.abs(rotGamma||0), Math.abs(rotBeta||0));
+      score += Math.max(0, rot-60) * 0.25; // >60°/s begins contributing
+      rashScore = Math.max(0, Math.min(100, Math.round(score)));
+      $('score').textContent = rashScore;
+      if(rashScore<30) setRiskTag('Low');
+      else if(rashScore<60) setRiskTag('Medium');
+      else setRiskTag('High');
+    }
+
+    function onPosition(pos){
+      const c = pos.coords;
+      $('gpsState').textContent = 'OK';
+      $('lat').textContent = c.latitude.toFixed(6);
+      $('lon').textContent = c.longitude.toFixed(6);
+      $('acc').textContent = (c.accuracy||0).toFixed(1);
+
+      const t = pos.timestamp; // ms
+      let vms = c.speed; // m/s (may be null)
+      derivedSpeed = false;
+
+      if(vms==null && lastFix){
+        const dt = (t - lastFix.t)/1000; // s
+        const d = haversine(lastFix.lat, lastFix.lon, c.latitude, c.longitude); // m
+        if(dt>0){ vms = d/dt; derivedSpeed = true; }
+      }
+
+      if(vms!=null){
+        // Smooth
+        const kmh = vms*3.6;
+        speedKmh = smoothSpeed(kmh);
+        $('speed').textContent = speedKmh.toFixed(1);
+        $('speedSrc').textContent = derivedSpeed? 'distance/time' : 'GPS sensor';
+
+        // Acceleration from speed deltas
+        if(lastFix){
+          const dt = (t - lastFix.t)/1000;
+          if(dt>0){
+            const a = ((vms) - (lastFix.v||vms))/dt; // m/s^2
+            accelFromSpeed = smoothAccel(a);
+            $('accel').textContent = accelFromSpeed.toFixed(2);
+            if(Math.abs(a)>5) log(`Severe accel spike: ${a.toFixed(2)} m/s²`);
+          }
+        }
+      }
+
+      lastFix = {lat:c.latitude, lon:c.longitude, t, v:vms||0};
+      updateScore({speedKmh, accel: accelFromSpeed, rotGamma: lastRot.gamma, rotBeta: lastRot.beta});
+    }
+
+    function onPositionError(err){
+      $('gpsState').textContent = 'Error';
+      log(`GPS error: ${err.message}`);
+    }
+
+    let lastRot = {alpha:0,beta:0,gamma:0};
+
+    function onDeviceMotion(e){
+      const rr = e.rotationRate || {};
+      // Update rotation readouts
+      lastRot.alpha = rr.alpha || 0; // around Z
+      lastRot.beta = rr.beta || 0;   // around X
+      lastRot.gamma = rr.gamma || 0; // around Y
+
+      $('rAlpha').textContent = Math.round(lastRot.alpha);
+      $('rBeta').textContent  = Math.round(lastRot.beta);
+      $('rGamma').textContent = Math.round(lastRot.gamma);
+
+      // Heuristic alerts
+      const maxTurn = Math.max(Math.abs(lastRot.beta), Math.abs(lastRot.gamma));
+      if(maxTurn>140) log(`Hard cornering detected: ~${Math.round(maxTurn)}°/s`);
+
+      updateScore({speedKmh, accel: accelFromSpeed, rotGamma: lastRot.gamma, rotBeta: lastRot.beta});
+    }
+
+    function onDeviceOrientation(e){
+      // Heading from alpha if available
+      let hdg = e.webkitCompassHeading; // iOS
+      if(typeof hdg === 'undefined'){
+        // Fallback to alpha (0–360)
+        hdg = (typeof e.alpha === 'number') ? (360 - e.alpha) : null; // invert to match compass
+      }
+      if(hdg!=null){
+        $('heading').textContent = `${hdg.toFixed(0)}°`;
+        $('needle').style.transform = `rotate(${hdg}deg)`;
+      }
+    }
+
+    async function requestMotionPermissionIfNeeded(){
+      const iOS = typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function';
+      if(iOS){
+        try{
+          const res = await DeviceOrientationEvent.requestPermission();
+          if(res !== 'granted'){ log('Motion permission not granted.'); }
+        }catch(e){ log('Motion permission request failed.'); }
+      }
+    }
+
+    function start(){
+      if(!('geolocation' in navigator)){
+        log('Geolocation not supported.');
+        return;
+      }
+      requestMotionPermissionIfNeeded();
+
+      // GPS watch
+      watchId = navigator.geolocation.watchPosition(onPosition, onPositionError, {
+        enableHighAccuracy: true, maximumAge: 500, timeout: 10000
+      });
+
+      // Motion/Orientation
+      window.addEventListener('devicemotion', onDeviceMotion);
+      window.addEventListener('deviceorientation', onDeviceOrientation);
+
+      $('btnStart').disabled = true;
+      $('btnStop').disabled = false;
+      log('Sensors started. Keep the phone steady in a vehicle mount for best results.');
+    }
+
+    function stop(){
+      if(watchId!=null){ navigator.geolocation.clearWatch(watchId); watchId=null; }
+      window.removeEventListener('devicemotion', onDeviceMotion);
+      window.removeEventListener('deviceorientation', onDeviceOrientation);
+      $('btnStart').disabled = false;
+      $('btnStop').disabled = true;
+      log('Sensors stopped.');
+    }
+
+    $('btnStart').addEventListener('click', start);
+    $('btnStop').addEventListener('click', stop);
+  </script>
+</body>
+</html>
